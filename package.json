@@ -4,9 +4,14 @@
   "private": true,
   "type": "module",
   "description": "Dedicated public telephony layer for CalmCall Darren V3 — Twilio voice webhook and OpenAI Realtime SIP webhook. Deployed as its own Vercel project, isolated from calmcall-website.",
+  "scripts": {
+    "test": "for f in test/*.test.js; do node \"$f\" || exit 1; done"
+  },
   "dependencies": {
+    "@vercel/functions": "^3.9.7",
     "openai": "^7.15.0",
-    "twilio": "^6.1.1"
+    "twilio": "^6.1.1",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "fast-xml-parser": "^5.11.1"

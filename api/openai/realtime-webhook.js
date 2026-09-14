@@ -2,10 +2,13 @@
 //
 // OpenAI Realtime webhook for Darren V3. Handles `realtime.call.incoming`
 // (fired when Twilio's <Dial><Sip> reaches OpenAI's Realtime SIP
-// connector): verifies the webhook signature, then accepts the call and
-// configures the realtime session directly — audio flows over the SIP/RTP
-// leg OpenAI already has open with Twilio, so there is no separate
-// text-generation -> ElevenLabs -> blob storage -> Twilio playback hop.
+// connector): verifies the webhook signature, accepts the call with
+// Darren's full session configuration (voice, turn detection, tools), then
+// hands off to the live-call bridge (api/_lib/call-session.js) which is
+// what actually makes lead capture, transfers, and hangups work — accepting
+// the call only starts it, it doesn't give us a way to react to what
+// happens next. See api/_lib/call-session.js for why that needs a separate
+// WebSocket connection.
 //
 // Like the Twilio endpoint, this is intentionally public — OpenAI cannot
 // authenticate against Vercel/Deployment Protection either. The webhook
@@ -15,22 +18,22 @@
 
 import OpenAI from 'openai';
 import readRawBody from '../_lib/rawBody.js';
+import buildDarrenInstructions from '../_lib/darren-instructions.js';
+import buildDarrenTools from '../_lib/darren-tools.js';
+import { scheduleCallSession } from '../_lib/call-session.js';
 
 export const config = { api: { bodyParser: false } };
 
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1-mini';
-
-// Placeholder persona — replace with Darren's real production system
-// prompt/script before going live. Kept deliberately generic here since
-// this project doesn't have Darren's actual copy on file.
-const DARREN_INSTRUCTIONS = process.env.DARREN_INSTRUCTIONS || `
-You are Darren, a warm, professional phone receptionist for CalmCall, a UK
-missed-call recovery service for trades and service businesses. Speak in
-natural British English — relaxed, concise, and polite, the way a helpful
-local receptionist would. Keep responses short and conversational, confirm
-the caller's name and reason for calling, and let them know their message
-will be passed on. Never claim to be human if asked directly.
-`.trim();
+// `marin` and `cedar` are the voices OpenAI recommends for best quality;
+// `cedar` reads as warm and conversational, which fits a receptionist.
+const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || 'cedar';
+const BUSINESS_NAME = process.env.BUSINESS_NAME || 'CalmCall';
+// Only set once a real live-transfer destination exists (e.g. a UK mobile
+// as tel:+44..., or a SIP URI for a desk phone/PBX). Left unset, Darren is
+// told plainly not to offer transfers instead of promising one that can't
+// actually happen.
+const TRANSFER_TARGET_URI = process.env.TRANSFER_TARGET_URI || '';
 
 function isPlainObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -79,35 +82,69 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'missing_call_id' });
   }
 
-  try {
-    const acceptResponse = await fetch(
-      `https://api.openai.com/v1/realtime/calls/${encodeURIComponent(callId)}/accept`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          type: 'realtime',
-          model: REALTIME_MODEL,
-          instructions: DARREN_INSTRUCTIONS,
-        }),
-      },
-    );
+  const transferAvailable = Boolean(TRANSFER_TARGET_URI);
 
-    if (!acceptResponse.ok) {
-      const detail = await acceptResponse.text().catch(() => '');
-      console.error('[realtime-webhook] accept call failed', {
-        callId,
-        status: acceptResponse.status,
-        detail,
-      });
-      return res.status(502).json({ error: 'accept_failed' });
-    }
+  try {
+    await client.realtime.calls.accept(callId, {
+      type: 'realtime',
+      model: REALTIME_MODEL,
+      instructions: process.env.DARREN_INSTRUCTIONS || buildDarrenInstructions({
+        businessName: BUSINESS_NAME,
+        transferAvailable,
+      }),
+      tools: buildDarrenTools({ transferAvailable }),
+      tool_choice: 'auto',
+      audio: {
+        input: {
+          // Phone audio arriving over a SIP trunk is effectively
+          // close-talking (a handset), not a room mic, so near_field is the
+          // right noise-reduction profile here.
+          noise_reduction: { type: 'near_field' },
+          // Semantic VAD (rather than fixed-silence server_vad) is what
+          // gives natural barge-in and turn-taking on a phone call: it
+          // waits longer when the caller trails off mid-thought instead of
+          // cutting them off after a fixed silence window, and
+          // interrupt_response is what lets the caller talk over Darren
+          // and have him actually stop.
+          turn_detection: {
+            type: 'semantic_vad',
+            eagerness: 'auto',
+            create_response: true,
+            interrupt_response: true,
+          },
+          transcription: {
+            model: 'gpt-4o-mini-transcribe',
+            language: 'en',
+          },
+        },
+        output: {
+          voice: REALTIME_VOICE,
+        },
+      },
+    });
   } catch (err) {
-    console.error('[realtime-webhook] accept call threw', { callId, message: err && err.message });
+    console.error('[realtime-webhook] accept call failed', {
+      callId,
+      status: err && err.status,
+      message: err && err.message,
+    });
     return res.status(502).json({ error: 'accept_failed' });
+  }
+
+  // The call is accepted and already live at this point. Everything from
+  // here on (tool calls, transcript, hangup) happens over a separate
+  // WebSocket for the life of the call, kicked off in the background so
+  // this webhook response isn't held open for the call's duration.
+  // CALMCALL_VOICE_TEST_MODE guards this in the test suite, which asserts
+  // on the HTTP response only and must not open a real socket to OpenAI.
+  if (process.env.CALMCALL_VOICE_TEST_MODE !== '1') {
+    scheduleCallSession({
+      callId,
+      sipHeaders: event.data.sip_headers,
+      client,
+      businessName: BUSINESS_NAME,
+      transferTargetUri: TRANSFER_TARGET_URI,
+    });
   }
 
   return res.status(200).json({ received: true });
