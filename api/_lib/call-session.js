@@ -208,6 +208,10 @@ export async function runCallSession({ callId, sipHeaders, client, businessName,
   });
   bridge.on('error', (err) => ctx.log('socket error', err && err.message));
 
+  bridge.socket.on('open', () => {
+    ctx.send({ type: 'response.create' });
+  });
+
   return new Promise((resolve) => {
     bridge.socket.on('close', async () => {
       await finalizeIncompleteCall(ctx).catch((err) => ctx.log('finalize error', err && err.message));
